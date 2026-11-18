@@ -1,5 +1,11 @@
 # Versatile MapDB
 # By Anthony Matarazzo (c) 2026
+
+> **Note:** the introduction below describes the design goals. The
+> [Implementation status](#implementation-status) table lists what `mapdb.hpp`
+> actually does today, and the [Quick Start](#include-mapdb) is code that
+> compiles against the shipped header.
+
 # Introduction
 
 A modern application often needs to manage large volumes of structured and unstructured data efficiently, which goes far beyond the capabilities of simple in-memory containers. While the C++ Standard Template Library (STL) provides useful abstractions like std::vector, std::map, and std::unordered_map, these structures are designed primarily for in-memory use and do not provide persistence or advanced indexing for complex datasets. A database such as MapDB fills this gap by combining the performance and flexibility of in-memory structures with persistent storage, sophisticated indexing, and query capabilities.
@@ -76,6 +82,47 @@ MapDB also provides a unified interface for query execution, allowing developers
 Joins across tables are handled efficiently using hash-based methods, which are significantly faster than nested loops over STL containers. Time/date joins, string joins, and multi-key joins are all supported.
 
 Overall, a database such as MapDB is functionally important because it provides persistent, high-performance storage, multi-type support, efficient indexing, compression, parallelism, and advanced query capabilities. STL containers alone cannot provide this functionality efficiently or safely for large datasets. MapDB bridges the gap between low-level container management and high-level database functionality.
+
+## Implementation status
+
+`mapdb.hpp` is the implementation, and this table separates what it does today
+from the parts of the design described in the introduction that are still
+aspirations:
+
+| Capability | Status |
+|---|---|
+| Memory-mapped record storage that survives restart | Implemented (`mapdb::Storage`) |
+| Zero-copy pointer views | Implemented (`mapdb::PointerView`) |
+| Hash index, exact lookup | Implemented (`addHashIndex`, `find`) |
+| Trie index, prefix search | Implemented (`addTrieIndex`, `prefix`) |
+| Wildcard matching with `*` and `?` | Implemented (`mapdb::wildcard_match`) |
+| Time/date keys and range filters | Implemented (time_point is hashable and ordered) |
+| Hash join across tables | Implemented (`mapdb::join`) |
+| Parallel filtered scans | Implemented (`parallelView`, `parallelQuery`) |
+| Composable query object | Implemented (`mapdb::QueryAST`, `mapdb::query`) |
+| Nibble, RLE and delta codecs | Implemented as reversible utilities; not applied inside `Storage` |
+| Index persistence to disk | Not implemented: indexes are rebuilt in RAM when a table opens |
+| Columnar or compressed on-disk layout | Not implemented: records are stored row-wise, uncompressed |
+| ACID transactions, multi-process writers | Not implemented |
+| Windows support | Not implemented: POSIX `mmap` only |
+
+Two consequences matter before you write a record struct:
+
+1. Records are memcpy'd into the mapping, so a record type must be trivially
+   copyable. `std::string` members make a struct non-trivially-copyable and will
+   not compile; use `mapdb::FixedString<N>` (or a plain `char[N]`) for text.
+2. A table maps a fixed capacity when it is opened, 64 MiB by default. Pass a
+   larger size as the second constructor argument for bigger datasets.
+
+## Build, run, test
+
+Requires C++17 and a POSIX system (Linux, macOS, BSD).
+
+```bash
+make test           # unit tests, plain build
+make test-sanitize  # the same suite under AddressSanitizer + UndefinedBehaviorSanitizer
+make demo           # builds both example programs
+```
 
 ## Using MapDB
 A practical example of MapDB is a **Customer Relationship Management (CRM) system**, where the database stores customers, interactions, and sales records. Each customer can have a unique ID, name, email, and registration date. Using MapDB, a table of customers can be defined with a record struct containing these fields. Pointer views allow the application to filter active customers, sort by registration date, and search for partial matches on names or emails efficiently.
@@ -164,26 +211,34 @@ Quick Start
 This guide demonstrates how to build a Customer Relationship Management (CRM) system using MapDB. It covers record definition, table creation, indexing, queries, pointer views, joins, and time/date handling.
 
 ## Include MapDB
+
 ```cpp
-#include "MapDB.hpp"  // Your MapDB header
+#include "mapdb.hpp"
+
+#include <chrono>
 #include <iostream>
 #include <string>
-#include <chrono>
+```
 
+## Define Record Structures
 
-Define Record Structures
+A record is plain data that the engine copies byte for byte into the mapped file.
+Text lives in `mapdb::FixedString<N>` so the struct stays trivially copyable, and
+timestamps stay `std::chrono::system_clock::time_point`.
+
+```cpp
 struct Customer {
     int id;
-    std::string name;
-    std::string email;
+    mapdb::Name name;                            // FixedString<64>
+    mapdb::FixedString<96> email;
     std::chrono::system_clock::time_point registration_date;
 };
 
 struct Interaction {
     int id;
     int customerId;
-    std::string type; // e.g., "email", "call"
-    std::string notes;
+    mapdb::FixedString<32> type;                 // "email", "call", "meeting"
+    mapdb::FixedString<128> notes;
     std::chrono::system_clock::time_point timestamp;
 };
 
@@ -196,27 +251,37 @@ struct Sale {
 ```
 
 ## Create Tables and Indexes
+
+Each table is one memory-mapped file. Indexes are added after the table opens,
+and adding one backfills it from records already on disk, so the same code is
+correct on the first run and on every restart.
+
 ```cpp
-Storage<Customer> customers("customers.db");
-Storage<Interaction> interactions("interactions.db");
-Storage<Sale> sales("sales.db");
+mapdb::Storage<Customer> customers("customers.db");
+mapdb::Storage<Interaction> interactions("interactions.db");
+mapdb::Storage<Sale> sales("sales.db");
 
-// Indexes
-customers.addHashIndex(&Customer::id);         // Exact lookups by ID
-customers.addTrieIndex(&Customer::name);       // Partial/prefix searches
+// Exact lookups by ID
+customers.addHashIndex(&Customer::id);
+sales.addHashIndex(&Sale::saleId);
 
+// Prefix / partial key searches
+customers.addTrieIndex(&Customer::name);
+sales.addTrieIndex(&Sale::amount);   // prefix search on the printed amount
+
+// Foreign keys, for joins and grouped lookups
 interactions.addHashIndex(&Interaction::customerId);
 sales.addHashIndex(&Sale::customerId);
-sales.addTrieIndex(&Sale::amount);            // Allow range queries on amount
 ```
 
 ## Insert Sample Data
+
 ```cpp
 auto now = std::chrono::system_clock::now();
 
 customers.insert({1, "Alice Smith", "alice@example.com", now});
-customers.insert({2, "Bob Johnson", "bob@example.com", now - std::chrono::hours(24*30)});
-customers.insert({3, "Carol White", "carol@example.com", now - std::chrono::hours(24*90)});
+customers.insert({2, "Bob Johnson", "bob@example.com", now - std::chrono::hours(24 * 30)});
+customers.insert({3, "Carol White", "carol@example.com", now - std::chrono::hours(24 * 90)});
 
 interactions.insert({1, 1, "email", "Discussed product features", now});
 interactions.insert({2, 2, "call", "Follow-up on invoice", now - std::chrono::hours(12)});
@@ -227,134 +292,206 @@ sales.insert({102, 2, 120.00, now - std::chrono::hours(24)});
 sales.insert({103, 1, 75.75, now - std::chrono::hours(72)});
 ```
 
-## Pointer View Example
-Filter all customers whose name starts with 'A':
+## Exact Lookup
+
+`find` uses the hash index and returns a pointer view, so nothing is copied. It
+yields every record sharing that key value.
 
 ```cpp
-auto viewA = customers.view([](const Customer& c){
+for (auto* c : customers.find(2)) {
+    std::cout << c->id << " " << c->name.c_str() << " <" << c->email.c_str() << ">\n";
+}
+```
+
+## Pointer View Example
+
+Filter all customers whose name starts with 'A'. Iteration hands you `Customer*`
+pointing straight into the mapping.
+
+```cpp
+auto viewA = customers.view([](const Customer& c) {
     return c.name.starts_with("A");
 });
 
-std::cout << "Customers starting with A:" << std::endl;
+std::cout << "Customers starting with A:\n";
 for (auto* c : viewA) {
-    std::cout << c->id << " " << c->name << " " << c->email << std::endl;
+    std::cout << c->id << " " << c->name.c_str() << " " << c->email.c_str() << "\n";
 }
 ```
 
 ## Time-Based Query Example
+
 Retrieve interactions in the last 48 hours:
+
 ```cpp
-auto recentInteractions = interactions.view([now](const Interaction& i){
+auto recentInteractions = interactions.view([now](const Interaction& i) {
     return i.timestamp > now - std::chrono::hours(48);
 });
 
-std::cout << "\nRecent interactions (last 48 hours):" << std::endl;
+std::cout << "\nRecent interactions (last 48 hours):\n";
 for (auto* i : recentInteractions) {
-    std::cout << "CustomerID: " << i->customerId 
-              << ", Type: " << i->type 
-              << ", Notes: " << i->notes << std::endl;
+    std::cout << "CustomerID: " << i->customerId
+              << ", Type: " << i->type.c_str()
+              << ", Notes: " << i->notes.c_str() << "\n";
 }
 ```
 
-## Join Example – Customers and Sales
-Get customers with sales over $100:
+## Join Example: Customers and Sales
+
+The join builds a hash of the left table on its key, probes it with the right
+table, and only then applies the predicate, so the filter never sees a cross
+product.
+
 ```cpp
-auto highValuePurchases = MapDB::join<Customer, Sale>(
+auto highValuePurchases = mapdb::join(
     customers, sales,
     &Customer::id, &Sale::customerId,
-    [](const Customer* c, const Sale* s){ return s->amount > 100.0; }
-);
+    [](const Customer*, const Sale* s) { return s->amount > 100.0; });
 
-std::cout << "\nCustomers with sales over $100:" << std::endl;
-for (auto* pair : highValuePurchases) {
-    const Customer* c = pair.first;
-    const Sale* s = pair.second;
-    std::cout << c->name << " purchased $" << s->amount << std::endl;
+std::cout << "\nCustomers with sales over $100:\n";
+for (auto& pair : highValuePurchases) {
+    std::cout << pair.first->name.c_str() << " purchased $" << pair.second->amount << "\n";
 }
 ```
 
 ## Partial Key Search Example
-Find sales with amounts starting with '7':
-```cpp
-auto partialSales = sales.view([](const Sale& s){
-    return std::to_string(int(s.amount)).starts_with("7");
-});
 
-std::cout << "\nSales with amount starting with 7:" << std::endl;
-for (auto* s : partialSales) {
-    std::cout << "CustomerID: " << s->customerId << ", Amount: " << s->amount << std::endl;
+Two ways to do it. The trie index answers prefix queries in time proportional to
+the prefix plus the size of the result set:
+
+```cpp
+for (auto* s : sales.prefix("7")) {          // trie on Sale::amount
+    std::cout << "CustomerID: " << s->customerId << ", Amount: " << s->amount << "\n";
 }
 ```
 
-## Enable Compression (Optional)
+Wildcard matching handles the general pattern case over any field:
+
 ```cpp
-customers.enableCompression<NibbleCompressor>();
-interactions.enableCompression<NibbleCompressor>();
-sales.enableCompression<NibbleCompressor>();
+auto smiths = customers.view([](const Customer& c) {
+    return mapdb::wildcard_match("*Smith*", c.name.sv());
+});
 ```
 
-This reduces memory and disk usage while maintaining fast access.
+## Compression (Optional, Standalone)
+
+The codecs are reversible utilities you apply to column data you choose to
+compress. `Storage` stores records uncompressed, so compression is something you
+layer on rather than a flag you flip:
+
+```cpp
+std::vector<uint8_t> sizes{7, 7, 7, 9, 9, 11};
+
+std::vector<uint8_t> packed;
+mapdb::NibbleCompressor::compress(sizes, packed);          // two values per byte
+
+std::vector<uint8_t> restored;
+mapdb::NibbleCompressor::decompress(packed, restored, sizes.size());
+
+auto runs = mapdb::RLE<uint8_t>::compress(sizes);          // (value, count) pairs
+auto back = mapdb::RLE<uint8_t>::decompress(runs);
+
+auto deltas = mapdb::Delta<int64_t>::encode({100, 103, 106});
+auto values = mapdb::Delta<int64_t>::decode(deltas);
+```
+
+`NibbleCompressor::decompress` takes the original element count because an odd
+number of values leaves a half-empty final byte. `RLE` stores a 32-bit count per
+run, so runs longer than 255 values survive a round trip even for `uint8_t` data.
 
 ## Persist Data to Disk
+
 ```cpp
 customers.flush();
 interactions.flush();
 sales.flush();
 ```
 
-Tables are stored as memory-mapped files, so reopening the program restores all records and indexes without reloading from scratch.
+Records live in the mapped file, so they are visible to the next process that
+opens it, and the store resumes appending after the last written record instead
+of overwriting it. Indexes are rebuilt from the file when the table opens: they
+are not serialised, so a restart costs one scan of the table.
 
 ## Parallel Query Example
+
+`parallelView` (also available as `parallelQuery`) partitions the scan across
+worker threads and merges the result. The predicate must be safe to run
+concurrently; the merge itself is synchronised.
+
 ```cpp
-auto parallelView = sales.parallelQuery([](const Sale& s){
+auto parallelView = sales.parallelQuery([](const Sale& s) {
     return s.amount > 100;
 });
 
-std::cout << "\nParallel query for sales > $100:" << std::endl;
+std::cout << "\nParallel query for sales > $100:\n";
 for (auto* s : parallelView) {
-    std::cout << "CustomerID: " << s->customerId << ", Amount: " << s->amount << std::endl;
+    std::cout << "CustomerID: " << s->customerId << ", Amount: $" << s->amount << "\n";
 }
 ```
 
-## Complete Main Function
+## Composing Conditions
 
-``cpp
-int main() {
-    // Insert sample data and run queries (as above)
-    return 0;
+`QueryAST` accumulates predicates with AND, which reads closer to a WHERE clause:
+
+```cpp
+mapdb::QueryAST<Sale> ast;
+ast.where([](const Sale& s) { return s.amount > 100.0; })
+   .where([](const Sale& s) { return s.customerId == 1; });
+
+for (auto* s : mapdb::query(sales, ast)) {
+    std::cout << "sale " << s->saleId << " $" << s->amount << "\n";
 }
+```
+
+## Complete Program
+
+`examples/crm_demo.cpp` is the whole of the above in one file, seeded only once
+so rerunning it demonstrates persistence instead of duplicating rows:
+
+```bash
+make demo && ./bin/crm_demo
 ```
 
 ## Summary
 
-This Quick Start demonstration shows how MapDB can be used to build a fully functional CRM system:
-Multi-table storage (Customers, Interactions, Sales)
-Hash and trie indexes for fast exact and partial key searches
-Pointer views for zero-copy iteration
-SQL-like joins across tables
-Time/date filtering and range queries
-Optional compression for storage efficiency
-Persistent memory-mapped storage
-Parallel query execution
+This quick start builds a working CRM store on MapDB:
 
-This setup provides a high-performance, persistent database engine entirely in C++, fully integrated into applications without relying on external databases.
+- Multi-table storage (Customers, Interactions, Sales)
+- Hash and trie indexes for exact and partial key searches
+- Pointer views for zero-copy iteration
+- Hash joins across tables
+- Time/date filtering and range queries
+- Persistent memory-mapped storage that resumes where it left off
+- Parallel query execution
+- Standalone compression codecs for column data
 
 ## Set Traversal
 
-```cpp
-// MapDB Advanced Queries & Joins Demo
-// Author: Anthony Matarazzo
-// License: GPL
+The program below exercises the whole surface at once: four tables, hash and trie
+indexes, pointer views, two joins, wildcard search and per-customer aggregation.
+It is checked in as `examples/advanced_demo.cpp` and built by `make demo`, so the
+code in this section is exactly what runs.
 
-#include "MapDB.hpp"  // Include the full MapDB header
+```cpp
+// MapDB advanced demo: multi-table joins, wildcards and pointer views.
+// This is the program shown in the "Set Traversal" section of README.md.
+//
+// Build:  make demo
+// Run:    ./bin/advanced_demo
+//
+// Records are trivially copyable, so text fields use mapdb::FixedString and
+// timestamps use std::chrono::system_clock::time_point.
+
+#include "mapdb.hpp"
+
+#include <chrono>
 #include <iostream>
 #include <string>
-#include <chrono>
 
 struct Customer {
     int id;
-    std::string name;
-    std::string email;
+    mapdb::Name name;
+    mapdb::FixedString<96> email;
     std::chrono::system_clock::time_point registration_date;
 };
 
@@ -367,8 +504,8 @@ struct Sale {
 
 struct Product {
     int productId;
-    std::string name;
-    std::string category;
+    mapdb::Name name;
+    mapdb::FixedString<32> category;
     double price;
 };
 
@@ -381,14 +518,13 @@ struct Order {
 };
 
 int main() {
+    using namespace mapdb;
 
-    // Initialize Tables
     Storage<Customer> customers("customers.db");
     Storage<Sale> sales("sales.db");
     Storage<Product> products("products.db");
     Storage<Order> orders("orders.db");
 
-    // Add indexes
     customers.addHashIndex(&Customer::id);
     customers.addTrieIndex(&Customer::name);
 
@@ -401,103 +537,86 @@ int main() {
     orders.addHashIndex(&Order::customerId);
     orders.addHashIndex(&Order::productId);
 
-    auto now = std::chrono::system_clock::now();
+    if (products.empty()) {
+        auto now = std::chrono::system_clock::now();
 
-    // Insert Customers
-    customers.insert({1, "Alice Smith", "alice@example.com", now - std::chrono::hours(24*100)});
-    customers.insert({2, "Bob Johnson", "bob@example.com", now - std::chrono::hours(24*50)});
-    customers.insert({3, "Carol White", "carol@example.com", now - std::chrono::hours(24*30)});
+        customers.insert({1, "Alice Smith", "alice@example.com", now - std::chrono::hours(24 * 100)});
+        customers.insert({2, "Bob Johnson", "bob@example.com", now - std::chrono::hours(24 * 50)});
+        customers.insert({3, "Carol White", "carol@example.com", now - std::chrono::hours(24 * 30)});
 
-    // Insert Products
-    products.insert({101, "Blue Shirt", "Clothing", 29.99});
-    products.insert({102, "Red Shirt", "Clothing", 35.99});
-    products.insert({103, "Gaming Mouse", "Electronics", 59.99});
+        products.insert({101, "Blue Shirt", "Clothing", 29.99});
+        products.insert({102, "Red Shirt", "Clothing", 35.99});
+        products.insert({103, "Gaming Mouse", "Electronics", 59.99});
 
-    // Insert Sales
-    sales.insert({201, 1, 250.50, now - std::chrono::hours(10)});
-    sales.insert({202, 2, 120.00, now - std::chrono::hours(5)});
-    sales.insert({203, 1, 75.75, now - std::chrono::hours(50)});
-    sales.insert({204, 3, 300.00, now - std::chrono::hours(2)});
+        sales.insert({201, 1, 250.50, now - std::chrono::hours(10)});
+        sales.insert({202, 2, 120.00, now - std::chrono::hours(5)});
+        sales.insert({203, 1, 75.75, now - std::chrono::hours(50)});
+        sales.insert({204, 3, 300.00, now - std::chrono::hours(2)});
 
-    // Insert Orders
-    orders.insert({301, 1, 101, 2, now - std::chrono::hours(10)});
-    orders.insert({302, 2, 102, 1, now - std::chrono::hours(5)});
-    orders.insert({303, 1, 103, 1, now - std::chrono::hours(50)});
-    orders.insert({304, 3, 103, 2, now - std::chrono::hours(2)});
+        orders.insert({301, 1, 101, 2, now - std::chrono::hours(10)});
+        orders.insert({302, 2, 102, 1, now - std::chrono::hours(5)});
+        orders.insert({303, 1, 103, 1, now - std::chrono::hours(50)});
+        orders.insert({304, 3, 103, 2, now - std::chrono::hours(2)});
+    }
 
     std::cout << "=== Customers Starting with 'A' ===\n";
-    auto customerA = customers.view([](const Customer& c){
-        return c.name.starts_with("A");
-    });
-    for (auto* c : customerA)
-        std::cout << c->id << " " << c->name << "\n";
+    for (auto* c : customers.view([](const Customer& x) { return x.name.starts_with("A"); })) {
+        std::cout << c->id << " " << c->name.c_str() << "\n";
+    }
 
     std::cout << "\n=== Sales Over $200 ===\n";
-    auto bigSales = sales.view([](const Sale& s){
-        return s.amount > 200;
-    });
-    for (auto* s : bigSales)
+    for (auto* s : sales.view([](const Sale& x) { return x.amount > 200; })) {
         std::cout << "CustomerID: " << s->customerId << " Amount: $" << s->amount << "\n";
+    }
 
     std::cout << "\n=== Join Customers and Sales Over $100 ===\n";
-    auto customerSales = MapDB::join<Customer, Sale>(
-        customers, sales,
-        &Customer::id, &Sale::customerId,
-        [](const Customer* c, const Sale* s){ return s->amount > 100; }
-    );
-    for (auto* pair : customerSales) {
-        const Customer* c = pair.first;
-        const Sale* s = pair.second;
-        std::cout << c->name << " purchased $" << s->amount << "\n";
+    auto customerSales = mapdb::join(customers, sales, &Customer::id, &Sale::customerId,
+                                     [](const Customer*, const Sale* s) { return s->amount > 100; });
+    for (auto& pair : customerSales) {
+        std::cout << pair.first->name.c_str() << " purchased $" << pair.second->amount << "\n";
     }
 
     std::cout << "\n=== Join Orders with Products and Customers ===\n";
-    auto orderDetails = MapDB::join<Order, Product>(
-        orders, products,
-        &Order::productId, &Product::productId,
-        [](const Order* o, const Product* p){ return true; }
-    );
-
-    for (auto* pair : orderDetails) {
+    auto orderDetails = mapdb::join(orders, products, &Order::productId, &Product::productId);
+    for (auto& pair : orderDetails) {
         const Order* o = pair.first;
         const Product* p = pair.second;
-        auto* c = customers.query(QueryAST{}.where([o](const Customer& cust){ return cust.id == o->customerId; }))[0];
-        std::cout << "Customer: " << c->name 
-                  << ", Product: " << p->name 
-                  << ", Qty: " << o->quantity << "\n";
+        auto who = customers.find(o->customerId);
+        std::cout << "Customer: " << (who.empty() ? "?" : who[0]->name.c_str()) << ", Product: "
+                  << p->name.c_str() << ", Qty: " << o->quantity << "\n";
     }
 
     std::cout << "\n=== Partial Key Search: Products with 'Shirt' ===\n";
-    auto shirts = products.view([](const Product& p){
-        return p.name.find("Shirt") != std::string::npos;
-    });
-    for (auto* p : shirts)
-        std::cout << p->name << " $" << p->price << "\n";
+    for (auto* p : products.view([](const Product& x) {
+             return mapdb::wildcard_match("*Shirt*", x.name.sv());
+         })) {
+        std::cout << p->name.c_str() << " $" << p->price << "\n";
+    }
 
-    std::cout << "\n=== Complex Query: Customers with Orders > 1 of Electronics ===\n";
-    auto complexQuery = MapDB::join<Order, Product>(
-        orders, products,
-        &Order::productId, &Product::productId,
-        [](const Order* o, const Product* p){ return p->category == "Electronics" && o->quantity > 1; }
-    );
-
-    for (auto* pair : complexQuery) {
+    std::cout << "\n=== Complex Query: Orders of more than one Electronics item ===\n";
+    auto electronics = mapdb::join(orders, products, &Order::productId, &Product::productId,
+                                   [](const Order* o, const Product* p) {
+                                       return p->category == std::string_view("Electronics") && o->quantity > 1;
+                                   });
+    for (auto& pair : electronics) {
         const Order* o = pair.first;
         const Product* p = pair.second;
-        auto* c = customers.query(QueryAST{}.where([o](const Customer& cust){ return cust.id == o->customerId; }))[0];
-        std::cout << c->name << " ordered " << o->quantity 
-                  << " x " << p->name << "\n";
+        auto who = customers.find(o->customerId);
+        std::cout << (who.empty() ? "?" : who[0]->name.c_str()) << " ordered " << o->quantity << " x "
+                  << p->name.c_str() << "\n";
     }
 
     std::cout << "\n=== Iteration of All Customers and Their Total Sales ===\n";
-    for (auto* c : customers.view([](const Customer&){ return true; })) {
+    for (auto* c : customers.all()) {
         double total = 0;
-        auto salesView = sales.view([c](const Sale& s){ return s.customerId == c->id; });
-        for (auto* s : salesView)
-            total += s->amount;
-        std::cout << c->name << " total sales: $" << total << "\n";
+        for (auto* s : sales.view([c](const Sale& x) { return x.customerId == c->id; })) total += s->amount;
+        std::cout << c->name.c_str() << " total sales: $" << total << "\n";
     }
 
+    customers.flush();
+    sales.flush();
+    products.flush();
+    orders.flush();
     return 0;
 }
 ```
@@ -515,39 +634,43 @@ SQL-like behavior in C++ templates
 MapDB (Memory-Mapped, Template-Based C++ Engine)
 Type: In-memory + persistent memory-mapped C++ database engine
 Language: C++17+ (header-only template library)
-Storage: Memory-mapped files for persistent storage, columnar compressed optional
-Indexing: Hash, Trie, Radix-Trie for partial and range queries
-Querying: SQL-like AST, joins, boolean expressions, wildcard search, time/date filters
-Compression: Inline NibbleStream, RLE, Delta, columnar compression
+Storage: Memory-mapped files, row-wise records, fixed capacity per table
+Indexing: Hash for exact keys, character trie for prefixes, time_point keys supported
+Querying: Composable predicates, hash joins, wildcard search, time/date filters
+Compression: Standalone Nibble, RLE and Delta codecs (applied by the caller)
 Pointer Views: Zero-copy pointer views for filtered/partial datasets
 Parallel Execution: Queries, joins, and filtering can run multi-threaded
 Feature Highlights:
 Multi-table relational joins
 Partial key and wildcard queries
 Flexible time/date support
-Columnar storage + compression reduces memory footprint
-Persistent indexes, fast restart without rebuilding indexes
+Codecs available for columnar compression of data you choose to compress
+Indexes rebuilt automatically from the file on open
 Pointer-based views eliminate copy overhead
 Template-based, type-safe, fully C++ integrated
 
-## Performance:
-Depends on table size and compression choice
-Hash indexes: O(1) average lookup
-Trie indexes: O(k) prefix/partial search
-Joins: O(n*m) naive, parallel execution improves scalability
-Memory-mapped I/O allows very large datasets without loading fully into RAM
-Database Size and Compression:
-Can handle hundreds of millions of records depending on disk
-Typical compression ratios with NibbleStream:
-Small integers: 2–5x
-Sparse datasets with repeated fields: 3–10x
-Columnar storage reduces I/O for selective queries
+## Performance
+Complexity of the implemented operations, where n is the record count of a table:
 
-## Limits:
-Single-file per table currently
-No ACID transactions; eventual persistence on flush()
-Joins are in-memory, so very large cross-joins may require sufficient RAM
-C++ only, no native network server or multi-client support
+- Hash index lookup: O(1) average, O(k) for the k records sharing a key
+- Trie prefix search: O(p) to walk the prefix, then the size of the result set
+- Filtered view (`view`, `parallelView`): O(n) over the table, split across up to 16 workers
+- Join: O(n + m) to build and probe the hash table, plus the predicate cost
+- Insert: O(1) plus one update per registered index, serialised by a mutex
+
+Indexes live in RAM and are rebuilt with one scan when a table opens, so startup
+cost is linear in the record count. This repository ships no benchmark harness:
+throughput depends on your record size, disk and query mix, so measure it on your
+own data before quoting numbers.
+
+## Limits
+- Single file per table, single writer process. There is no inter-process locking.
+- Fixed capacity chosen at open time; `insert` throws once the table is full.
+- No ACID transactions: durability is whatever `flush()` (msync) has pushed out.
+- Records must be trivially copyable, and they are stored uncompressed, row-wise.
+- Indexes are held in RAM only and are rebuilt when the table opens.
+- Joins build an in-memory hash of the left table.
+- POSIX only (`mmap`), C++ only, no network protocol or multi-client support.
 
 Comparison with Other Engines
 Feature / Engine
@@ -587,7 +710,7 @@ Full SQL / indexes
 Only keys
 Range via keys
 Compression
-Inline + columnar
+Codecs, caller applied
 Optional via extension
 Built-in TOAST / indexes
 Optional snapshot compression
@@ -638,12 +761,18 @@ No (manual write flush)
 ## Key Takeaways
 
 MapDB excels in C++ applications where memory-mapped persistent storage, template-based type safety, and pointer views are needed.
-Its hybrid Trie + Hash indexing supports partial key, wildcard, and range queries, which is something basic STL containers or LevelDB cannot provide.
-Compression ratios (2–10x) make it very storage efficient for large datasets with repeated or small integer fields.
+Its hash plus trie indexing supports exact, prefix and wildcard queries, which plain STL containers do not provide out of the box.
+The codecs can compress repetitive column data substantially, but `Storage` itself stores records uncompressed today.
 Parallel query execution allows scaling with CPU cores for joins and searches.
 Limitations include lack of full ACID transactions, single-file per table, and in-memory joins for very large tables may hit RAM limits.
 Compared to SQLite, MapDB trades full SQL features for performance and memory efficiency in embedded C++ applications.
 Compared to PostgreSQL, MapDB is lighter weight, embedded, and fully in-memory with persistence, but lacks advanced SQL and network client support.
+
+## Projected benchmark figures
+
+Everything in this section was written as a projection before the engine was
+implemented. It is not a measurement, the harness is not in this repository, and
+the numbers should be treated as targets to validate rather than results.
 
 Test Setup
 Dataset:
@@ -673,7 +802,7 @@ Join query (Customer → Sales → Orders)
 Total database size on disk
 Compression ratio
 
-Metrics Table (Expected)
+Metrics Table (projected, not measured)
 Operation / Engine
 MapDB
 std::unordered_map
@@ -716,7 +845,7 @@ Compression ratio
 1.27:1
 
 ## Analysis
-MapDB Insertion: Slightly slower than raw unordered_map due to MMAP persistence and index maintenance, but still very fast.
+MapDB Insertion: Expected to be somewhat slower than raw unordered_map because of index maintenance and page faults on first touch.
 
 Query Speed: MapDB’s Hash index gives near-O(1) lookups, Trie gives fast partial key searches, outperforming linear STL scans and SQLite LIKE queries.
 

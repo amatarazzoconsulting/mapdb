@@ -7,12 +7,15 @@ BIN := bin
 TESTS := $(BIN)/test_mapdb
 DEMO  := $(BIN)/crm_demo
 DEMO2 := $(BIN)/advanced_demo
+SCIENCE := $(BIN)/scientific_benchmark
 
-.PHONY: all test test-sanitize demo docs-check clean
+.PHONY: all test test-sanitize demo docs-check clean scientific-benchmark
 
 all: test docs-check demo
 
 demo: $(DEMO) $(DEMO2)
+
+scientific-benchmark: $(SCIENCE)
 
 $(BIN):
 	@mkdir -p $(BIN)
@@ -24,6 +27,9 @@ $(DEMO): examples/crm_demo.cpp mapdb.hpp | $(BIN)
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS) $(LDLIBS)
 
 $(DEMO2): examples/advanced_demo.cpp mapdb.hpp | $(BIN)
+	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS) $(LDLIBS)
+
+$(SCIENCE): examples/scientific_benchmark.cpp mapdb.hpp | $(BIN)
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS) $(LDLIBS)
 
 test: $(TESTS)

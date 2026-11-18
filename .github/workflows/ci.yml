@@ -1,0 +1,41 @@
+name: build and test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.compiler }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compiler: g++
+            cxx: g++
+          - compiler: clang++
+            cxx: clang++
+
+    env:
+      CXX: ${{ matrix.cxx }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show compiler
+        run: $CXX --version
+
+      - name: Build and run the test suite
+        run: make test
+
+      - name: Run under AddressSanitizer and UndefinedBehaviorSanitizer
+        run: make test-sanitize
+
+      - name: Check the README samples still compile and run
+        run: make docs-check
+
+      - name: Build the example programs
+        run: make demo
